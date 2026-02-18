@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  vuz-bot:
+    build: .
+    container_name: vuz-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    volumes:
+      - ./:/app
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /tmp/bot.pid && kill -0 $(cat /tmp/bot.pid)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    tty: false
