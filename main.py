@@ -2,65 +2,67 @@ import asyncio
 import json
 import logging
 import os
+import sys
+from datetime import datetime
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import CommandStart, StateFilter
-from colorama import init, Fore, Style
+from colorama import init, Fore, Back, Style
 
 # Для healthcheck-сервера
 from aiohttp import web
 
-# Инициализация colorama для цветного логирования
-init(autoreset=True)
+# Инициализация colorama для цветного логирования в Docker
+init(autoreset=True, strip=False)
+os.environ['PYTHONUNBUFFERED'] = '1'
 
-# Настройка логирования
+# --- ФУНКЦИИ ЛОГИРОВАНИЯ (как во втором боте) ---
+def get_time():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# Цвета для разных событий
-START_COLOR = Fore.CYAN
-USER_COLOR = Fore.MAGENTA
-QUESTION_COLOR = Fore.YELLOW
-RESULT_COLOR = Fore.GREEN
-ERROR_COLOR = Fore.RED
+def get_user_info(user):
+    username = f"@{user.username}" if user.username else "NoUsername"
+    return f"ID:{user.id} | {username} | {user.first_name}"
 
-class ColorFormatter(logging.Formatter):
-    def format(self, record):
-        msg = super().format(record)
-        if hasattr(record, 'color'):
-            return f"{record.color}{msg}{Style.RESET_ALL}"
-        return msg
+def log_user_action(user, action):
+    """Белый текст на Розовом фоне для действий пользователя"""
+    print(f"{Fore.WHITE}{Back.MAGENTA}[{get_time()}] ПОЛЬЗОВАТЕЛЬ [{get_user_info(user)}] >>> {action}{Style.RESET_ALL}", flush=True)
 
-formatter = ColorFormatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler = logging.FileHandler('bot.log', encoding='utf-8')
-file_handler.setFormatter(formatter)
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(formatter)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logger.handlers = [file_handler, stream_handler]
+def log_bot_reply(user, reply_text):
+    """Белый текст на Синем фоне для ответов бота"""
+    short_text = (reply_text[:100] + '...') if len(reply_text) > 100 else reply_text
+    print(f"{Fore.WHITE}{Back.BLUE}[{get_time()}] БОТ ОТВЕТИЛ [{get_user_info(user)}] <<< {short_text}{Style.RESET_ALL}", flush=True)
+
+def log_system(text):
+    """Зеленый текст для системных событий"""
+    print(f"{Fore.GREEN}[{get_time()}] СИСТЕМА: {text}{Style.RESET_ALL}", flush=True)
+
+def log_error(text):
+    """Красный текст для ошибок"""
+    print(f"{Fore.RED}[{get_time()}] ОШИБКА: {text}{Style.RESET_ALL}", flush=True)
 
 # Токен бота (читается из переменной окружения `BOT_TOKEN`)
 TOKEN = os.getenv('BOT_TOKEN')
+if not TOKEN or TOKEN.strip() == '':
+    log_error("BOT_TOKEN не задан — установите переменную окружения BOT_TOKEN")
+    raise SystemExit(1)
 
-# Загрузка данных из JSON с обработкой ошибок и валидацией
+# --- ЗАГРУЗКА ДАННЫХ ---
 VUZ_DATA = []
 try:
     with open('vuz_data.json', 'r', encoding='utf-8') as f:
         raw = json.load(f)
-        # Нормализуем и валидируем записи
         for i, entry in enumerate(raw):
             if not isinstance(entry, dict):
-                logger.warning(f"Запись {i} не является объектом, пропущена", extra={'color': ERROR_COLOR})
+                log_error(f"Запись {i} не является объектом, пропущена")
                 continue
-            # Привести ключи к нижнему регистру
             norm = {k.lower(): v for k, v in entry.items()}
-            # Проверить обязательные поля
             if 'вуз' not in norm or 'специальность' not in norm or 'предметы_список' not in norm:
-                logger.warning(f"Запись {i} не содержит обязательных полей (вуз/специальность/предметы_список)", extra={'color': ERROR_COLOR})
+                log_error(f"Запись {i} не содержит обязательных полей (вуз/специальность/предметы_список)")
                 continue
-            # Конвертировать числовые поля
             for k in list(norm.keys()):
                 if 'мин' in k or 'проходной' in k or k.endswith('_балл') or k.endswith('_сумма'):
                     try:
@@ -71,8 +73,9 @@ try:
                         except Exception:
                             norm[k] = 0
             VUZ_DATA.append(norm)
+    log_system(f"Загружено {len(VUZ_DATA)} записей из vuz_data.json")
 except Exception as e:
-    logger.error(f"Ошибка загрузки vuz_data.json: {e}", extra={'color': ERROR_COLOR})
+    log_error(f"Ошибка загрузки vuz_data.json: {e}")
 
 # Список всех возможных предметов
 ALL_SUBJECTS = [
@@ -90,17 +93,13 @@ class UserState(StatesGroup):
     viewing_direction = State()
 
 # Инициализация бота и диспетчера
-if not TOKEN or TOKEN.strip() == '':
-    logger.error("BOT_TOKEN не задан — установите переменную окружения BOT_TOKEN", extra={'color': ERROR_COLOR})
-    raise SystemExit(1)
-
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# Функция для парсинга предметов из строки
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def parse_subjects(subjects_str):
     subjects = [s.strip() for s in str(subjects_str).split(',') if s.strip()]
     required = []
@@ -116,7 +115,6 @@ def parse_subjects(subjects_str):
             required.append(subj)
     return required, alternatives
 
-# Маппинг отображаемых имён предметов -> внутренние ключи
 SUBJECT_DISPLAY = {
     'математика': 'математика',
     'русский': 'русский',
@@ -130,20 +128,15 @@ SUBJECT_DISPLAY = {
     'история': 'история',
     'общество': 'общество'
 }
-
-DISPLAY_TO_KEY = {k: v for k, v in SUBJECT_DISPLAY.items()}
 KEY_TO_DISPLAY = {v: k for k, v in SUBJECT_DISPLAY.items()}
 
-# Функция для проверки соответствия баллов
 def check_fit(user_scores, entry):
     try:
         subjects_str = entry.get('предметы_список') or entry.get('Предметы_список')
         required, alternatives = parse_subjects(subjects_str)
-        # Проверить обязательные предметы
         for req in required:
             if req not in user_scores:
                 return False
-        # Проверить альтернативы (хотя бы один из группы)
         for alt_group in alternatives:
             has_one = False
             for alt in alt_group:
@@ -152,7 +145,6 @@ def check_fit(user_scores, entry):
                     break
             if not has_one:
                 return False
-        # Проверить минимальные баллы
         min_fields = {
             'математика': 'мин_математика',
             'русский': 'мин_русский',
@@ -177,10 +169,9 @@ def check_fit(user_scores, entry):
         passing_score = int(entry.get('проходной_балл_сумма', entry.get('Проходной_балл_сумма', 0)))
         return total_score >= passing_score
     except Exception as e:
-        logger.error(f"Ошибка проверки соответствия: {e}", extra={'color': ERROR_COLOR})
+        log_error(f"Ошибка проверки соответствия: {e}")
         return False
 
-# Функция для фильтрации подходящих вузов
 def find_matching_vuz(user_scores):
     matches = []
     for entry in VUZ_DATA:
@@ -188,57 +179,48 @@ def find_matching_vuz(user_scores):
             matches.append(entry)
     return matches
 
-# Команда /start — главное меню
+# --- ОБРАБОТЧИКИ ---
 @router.message(CommandStart(), StateFilter('*'))
 async def start_command(message: types.Message, state: FSMContext):
     try:
         await state.clear()
-        logger.info(f"Пользователь {message.from_user.id} ({message.from_user.full_name}) начал работу с ботом", extra={'color': START_COLOR})
+        log_user_action(message.from_user, "Команда /start")
         kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Подобрать по ЕГЭ')], [KeyboardButton(text='Просмотреть направления')]], resize_keyboard=True)
         await message.answer("Выберите действие:", reply_markup=kb)
         await state.set_state(UserState.start_menu)
+        log_bot_reply(message.from_user, "Главное меню")
     except Exception as e:
-        logger.exception(f"start_command error for user {getattr(message.from_user, 'id', 'N/A')}: {e}", extra={'color': ERROR_COLOR})
-        return
+        log_error(f"start_command error: {e}")
 
-# Обработка выбора предметов
 @router.callback_query(lambda c: c.data.startswith('select_'), StateFilter(UserState.choosing_subjects))
 async def select_subject(callback_query: types.CallbackQuery, state: FSMContext):
     try:
-        subj = callback_query.data[7:]  # Убрать 'select_'
+        subj = callback_query.data[7:]
         data = await state.get_data()
         selected = data.get('selected_subjects', [])
-
         if subj in selected:
             selected.remove(subj)
         else:
             selected.append(subj)
-
         await state.update_data(selected_subjects=selected)
 
-        # Построим клавиатуру с отображаемыми именами предметов
         keyboard = InlineKeyboardMarkup(inline_keyboard=[])
         buttons = []
         for s in ALL_SUBJECTS:
             disp = KEY_TO_DISPLAY.get(s, s)
             text = f"{'✔ ' if s in selected else ''}{disp}"
             buttons.append(types.InlineKeyboardButton(text=text, callback_data=f'select_{s}'))
-        # Кнопка подтверждения
         buttons.append(types.InlineKeyboardButton(text='Подтвердить выбор', callback_data='confirm'))
-        # Разделим по рядам по 3
         for i in range(0, len(buttons), 3):
             keyboard.inline_keyboard.append(buttons[i:i+3])
-
         try:
             await callback_query.message.edit_reply_markup(reply_markup=keyboard)
-        except Exception as e:
-            logger.warning(f"Не удалось обновить клавиатуру: {e}", extra={'color': ERROR_COLOR})
-        logger.info(f"Пользователь {callback_query.from_user.id} ({callback_query.from_user.full_name}) выбрал/снял предмет: {subj}", extra={'color': USER_COLOR})
+        except Exception:
+            pass
+        log_user_action(callback_query.from_user, f"Выбрал/снял предмет: {subj}")
     except Exception as e:
-        logger.exception(f"select_subject error: {e}", extra={'color': ERROR_COLOR})
-        return
+        log_error(f"select_subject error: {e}")
 
-# Подтверждение выбора
 @router.callback_query(lambda c: c.data == 'confirm', StateFilter(UserState.choosing_subjects))
 async def confirm_selection(callback_query: types.CallbackQuery, state: FSMContext):
     try:
@@ -248,18 +230,14 @@ async def confirm_selection(callback_query: types.CallbackQuery, state: FSMConte
             await callback_query.answer("Выберите хотя бы один предмет!")
             return
         await state.update_data(selected_subjects=selected, scores={})
-        # Построим inline-кнопки для ввода баллов по каждому выбранному предмету
         kb = InlineKeyboardMarkup(inline_keyboard=[])
         rows = []
         for subj in selected:
             rows.append([types.InlineKeyboardButton(text=f"Ввести {KEY_TO_DISPLAY.get(subj, subj)}", callback_data=f'enter_{subj}')])
-        # Кнопка Готово для завершения ввода
         rows.append([types.InlineKeyboardButton(text='Готово', callback_data='done_scores')])
         kb.inline_keyboard = rows
-
         await callback_query.message.answer("Нажмите на предмет, чтобы ввести балл, или нажмите 'Готово' после ввода всех баллов:", reply_markup=kb)
-        logger.info(f"Пользователь {callback_query.from_user.id} ({callback_query.from_user.full_name}) подтвердил выбор предметов: {selected}", extra={'color': QUESTION_COLOR})
-        # Убрать клавиатуру выбора предметов на предыдущем сообщении
+        log_user_action(callback_query.from_user, f"Подтвердил выбор предметов: {selected}")
         try:
             await callback_query.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -267,46 +245,37 @@ async def confirm_selection(callback_query: types.CallbackQuery, state: FSMConte
         await callback_query.answer()
         await state.set_state(UserState.entering_scores)
     except Exception as e:
-        logger.exception(f"confirm_selection error: {e}", extra={'color': ERROR_COLOR})
-        return
+        log_error(f"confirm_selection error: {e}")
 
-# Обработчик возврата в главное меню через inline-кнопку
 @router.callback_query(lambda c: c.data == 'main_menu', StateFilter(UserState.choosing_subjects))
 async def main_menu_callback(callback_query: types.CallbackQuery, state: FSMContext):
     try:
         await callback_query.answer()
         await state.clear()
-        # Вызовем стартовую команду, используя сообщение от callback
         await start_command(callback_query.message, state)
     except Exception as e:
-        logger.exception(f"main_menu_callback error: {e}", extra={'color': ERROR_COLOR})
-        return
+        log_error(f"main_menu_callback error: {e}")
 
-# Ввод баллов (нажатие на кнопку предмета)
 @router.callback_query(lambda c: c.data.startswith('enter_'), StateFilter(UserState.entering_scores))
 async def enter_score(callback_query: types.CallbackQuery, state: FSMContext):
     try:
-        subj = callback_query.data[6:]  # Убрать 'enter_'
+        subj = callback_query.data[6:]
         await state.update_data(current_subject=subj)
-        # Запросим у пользователя числовой ввод
         await callback_query.message.answer(f"Введите балл по предмету '{KEY_TO_DISPLAY.get(subj, subj)}' (целое число от 0 до 100):")
-        logger.info(f"Пользователь {callback_query.from_user.id} ({callback_query.from_user.full_name}) начал ввод балла по предмету: {subj}", extra={'color': QUESTION_COLOR})
+        log_user_action(callback_query.from_user, f"Начал ввод балла по предмету: {subj}")
         await callback_query.answer()
     except Exception as e:
-        logger.exception(f"enter_score error: {e}", extra={'color': ERROR_COLOR})
-        return
+        log_error(f"enter_score error: {e}")
 
-# Обработка ввода балла
 @router.message(lambda message: message.text and message.text.isdigit(), StateFilter(UserState.entering_scores))
 async def process_score(message: types.Message, state: FSMContext):
     try:
-        # Проверка: только числа от 0 до 100
         score = int(message.text)
         if not 0 <= score <= 100:
             raise ValueError
     except Exception:
         await message.answer("Введите корректное целое число от 0 до 100!")
-        logger.info(f"Пользователь {message.from_user.id} ({message.from_user.full_name}) ввел некорректный балл: {message.text}", extra={'color': ERROR_COLOR})
+        log_user_action(message.from_user, f"Ввёл некорректный балл: {message.text}")
         return
     try:
         data = await state.get_data()
@@ -317,10 +286,9 @@ async def process_score(message: types.Message, state: FSMContext):
         scores = data.get('scores', {})
         scores[subj] = score
         await state.update_data(scores=scores)
-        logger.info(f"Пользователь {message.from_user.id} ({message.from_user.full_name}) ввел балл {score} по предмету {subj}", extra={'color': USER_COLOR})
+        log_user_action(message.from_user, f"Ввёл балл {score} по предмету {subj}")
 
         selected = data.get('selected_subjects', [])
-        # Найти следующий предмет без балла
         next_subj = None
         for s in selected:
             if s not in scores:
@@ -329,21 +297,18 @@ async def process_score(message: types.Message, state: FSMContext):
         if next_subj:
             await message.answer(f"Балл сохранен. Нажмите кнопку 'Ввести {KEY_TO_DISPLAY.get(next_subj, next_subj)}' чтобы ввести следующий балл.")
             return
-        # Все баллы введены — расчёт
         matches = find_matching_vuz(scores)
         if not matches:
             await message.answer("Извините, по вашим баллам ничего не подошло.")
-            logger.info(f"Пользователь {message.from_user.id} ({message.from_user.full_name}) не найдено подходящих вузов", extra={'color': RESULT_COLOR})
+            log_system(f"Пользователь {message.from_user.id} не нашёл подходящих вузов")
             await state.clear()
             return
         await state.update_data(matches=matches, current_index=0, last_result_message_id=None)
         await state.set_state(UserState.viewing_results)
         await send_result(message.chat.id, state)
     except Exception as e:
-        logger.exception(f"process_score error: {e}", extra={'color': ERROR_COLOR})
-        return
+        log_error(f"process_score error: {e}")
 
-# Показ результата
 async def send_result(chat_id: int, state: FSMContext):
     try:
         data = await state.get_data()
@@ -358,14 +323,11 @@ async def send_result(chat_id: int, state: FSMContext):
             index = len(matches) - 1
         entry = matches[index]
 
-        # Сформировать текст карточки: показать ВУЗ, специальность, проходной балл и мин. баллы по предметам
         title = f"{entry.get('вуз', 'ВУЗ')} — {entry.get('специальность', '')}"
         desc_lines = []
-        # Проходной балл (сумма)
         passing = entry.get('проходной_балл_сумма') or entry.get('Проходной_балл_сумма') or entry.get('проходной_балл')
         if passing:
             desc_lines.append(f"Проходной балл: {passing}")
-        # Минимальные баллы по предметам
         min_fields = {
             'математика': 'мин_математика',
             'русский': 'мин_русский',
@@ -381,28 +343,22 @@ async def send_result(chat_id: int, state: FSMContext):
         }
         for subj, field in min_fields.items():
             val = entry.get(field)
-            if val is None:
-                continue
-            try:
-                iv = int(val)
-            except Exception:
-                continue
-            if iv > 0:
-                desc_lines.append(f"{KEY_TO_DISPLAY.get(subj, subj)} — мин: {iv}")
-        # Доп. информация (коротко)
+            if val:
+                try:
+                    iv = int(val)
+                    if iv > 0:
+                        desc_lines.append(f"{KEY_TO_DISPLAY.get(subj, subj)} — мин: {iv}")
+                except:
+                    pass
         for key in ('форма', 'срок', 'бюджет', 'платно', 'места'):
             if entry.get(key):
                 desc_lines.append(f"{key}: {entry.get(key)}")
-
-        # Полное описание, если есть (ограничим длину)
         desc = entry.get('описание')
         if desc:
             desc_lines.append('')
             desc_lines.append(desc[:800])
-
         text = f"<b>{title}</b>\n" + "\n".join(desc_lines)
 
-        # Клавиатура навигации
         keyboard = InlineKeyboardMarkup(inline_keyboard=[])
         nav = []
         if index > 0:
@@ -412,7 +368,6 @@ async def send_result(chat_id: int, state: FSMContext):
         if nav:
             keyboard.inline_keyboard.append(nav)
 
-        # Кнопки-ссылки
         link_buttons = []
         url_univ = entry.get('ссылка_вуз') or entry.get('сайт')
         url_spec = entry.get('ссылка_специальность') or entry.get('ссылка')
@@ -422,10 +377,8 @@ async def send_result(chat_id: int, state: FSMContext):
             link_buttons.append(types.InlineKeyboardButton(text='Страница специальности', url=url_spec))
         if link_buttons:
             keyboard.inline_keyboard.append(link_buttons)
-
         keyboard.inline_keyboard.append([types.InlineKeyboardButton(text='Завершить', callback_data='finish')])
 
-        # Сначала попытаемся отправить новую карточку — если отправка провалится, старое сообщение останется
         result_msg = None
         photo = entry.get('фото_специальности')
         try:
@@ -433,15 +386,13 @@ async def send_result(chat_id: int, state: FSMContext):
                 try:
                     result_msg = await bot.send_photo(chat_id, photo, caption=text, parse_mode='HTML', reply_markup=keyboard)
                 except Exception:
-                    # fallback: отправить текст и ссылку на фото
                     result_msg = await bot.send_message(chat_id, text + (f"\n\nФото: {photo}" if photo else ''), parse_mode='HTML', reply_markup=keyboard)
             else:
                 result_msg = await bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=keyboard)
         except Exception as e:
-            logger.warning(f"Не удалось отправить результат (везде): {e}", extra={'color': ERROR_COLOR})
+            log_error(f"Не удалось отправить результат: {e}")
             return
 
-        # Удалить предыдущее сообщение результата (если было)
         last_id = data.get('last_result_message_id')
         try:
             if last_id and last_id != result_msg.message_id:
@@ -450,12 +401,10 @@ async def send_result(chat_id: int, state: FSMContext):
             pass
 
         await state.update_data(last_result_message_id=result_msg.message_id, current_index=index)
-        logger.info(f"Пользователь {chat_id} просмотрел результат {index+1}/{len(matches)}", extra={'color': RESULT_COLOR})
+        log_system(f"Пользователь {chat_id} просмотрел результат {index+1}/{len(matches)}")
     except Exception as e:
-        logger.exception(f"send_result error: {e}", extra={'color': ERROR_COLOR})
-        return
+        log_error(f"send_result error: {e}")
 
-# Навигация по результатам
 @router.callback_query(lambda c: c.data in ['prev', 'next'], StateFilter(UserState.viewing_results))
 async def navigate_results(callback_query: types.CallbackQuery, state: FSMContext):
     try:
@@ -469,10 +418,9 @@ async def navigate_results(callback_query: types.CallbackQuery, state: FSMContex
         await state.update_data(current_index=index)
         await callback_query.answer()
         await send_result(callback_query.message.chat.id, state)
-        logger.info(f"Пользователь {callback_query.from_user.id} ({callback_query.from_user.full_name}) переключил результат на {index+1}", extra={'color': RESULT_COLOR})
+        log_user_action(callback_query.from_user, f"Переключил результат на {index+1}")
     except Exception as e:
-        logger.exception(f"navigate_results error: {e}", extra={'color': ERROR_COLOR})
-        return
+        log_error(f"navigate_results error: {e}")
 
 @router.callback_query(lambda c: c.data == 'finish', StateFilter(UserState.viewing_results))
 async def finish_results(callback_query: types.CallbackQuery, state: FSMContext):
@@ -480,33 +428,29 @@ async def finish_results(callback_query: types.CallbackQuery, state: FSMContext)
         await state.clear()
         await callback_query.message.answer("Спасибо — сессия завершена.")
         await callback_query.answer()
+        log_user_action(callback_query.from_user, "Завершил сессию")
     except Exception as e:
-        logger.exception(f"finish_results error: {e}", extra={'color': ERROR_COLOR})
-        return
+        log_error(f"finish_results error: {e}")
 
-# Обработка главного меню (reply-клавиатура)
 @router.message(lambda m: m.text == 'Подобрать по ЕГЭ', StateFilter(UserState.start_menu))
 async def menu_pick_by_scores(message: types.Message, state: FSMContext):
-    # Перевести в выбор предметов через inline-клавиатуру (callback'ы select_/confirm)
     await state.clear()
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     buttons = []
     for subj in ALL_SUBJECTS:
         disp = KEY_TO_DISPLAY.get(subj, subj)
         buttons.append(types.InlineKeyboardButton(text=disp, callback_data=f'select_{subj}'))
-    # Добавим кнопку подтверждения и возврата в главное меню
     buttons.append(types.InlineKeyboardButton(text='Подтвердить выбор', callback_data='confirm'))
     buttons.append(types.InlineKeyboardButton(text='Главное меню', callback_data='main_menu'))
     for i in range(0, len(buttons), 3):
         keyboard.inline_keyboard.append(buttons[i:i+3])
     await message.answer('Выберите предметы, которые вы сдавали (нажмите по каждому):', reply_markup=keyboard)
     await state.set_state(UserState.choosing_subjects)
+    log_user_action(message.from_user, "Начал подбор по ЕГЭ")
 
 @router.message(lambda m: m.text == 'Просмотреть направления', StateFilter(UserState.start_menu))
 async def menu_view_directions(message: types.Message, state: FSMContext):
-    # Показать список вузов (reply keyboard)
     await state.clear()
-    # собрать уникальные названия вузов
     univs = []
     for e in VUZ_DATA:
         name = e.get('вуз', e.get('Вуз', ''))
@@ -517,105 +461,81 @@ async def menu_view_directions(message: types.Message, state: FSMContext):
     kb = ReplyKeyboardMarkup(keyboard=keyboard_rows, resize_keyboard=True)
     await message.answer('Выберите вуз:', reply_markup=kb)
     await state.set_state(UserState.choosing_university)
+    log_user_action(message.from_user, "Начал просмотр направлений")
 
-# Обработка выбора вуза
 @router.message(StateFilter(UserState.choosing_university))
 async def choose_university(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text == 'Главное меню':
         await start_command(message, state)
         return
-    # отфильтровать направления по вузу
     filtered = [e for e in VUZ_DATA if (e.get('вуз', e.get('Вуз', '')).strip().lower() == text.lower())]
     if not filtered:
         await message.answer('Не найдено направлений для выбранного вуза. Выберите другой вуз или главное меню.')
+        log_user_action(message.from_user, f"Выбрал несуществующий вуз: {text}")
         return
     await state.update_data(filtered_directions=filtered, current_index=0, last_result_message_id=None)
     await send_result(message.chat.id, state)
     await state.set_state(UserState.viewing_results)
+    log_user_action(message.from_user, f"Выбрал вуз: {text}")
 
-# Обработка не-текстовых сообщений (фото, видео, гиф, документы и т.д.)
 @router.message(StateFilter(UserState.entering_scores))
 async def handle_non_text(message: types.Message, state: FSMContext):
     if not message.text:
         await message.answer("Пожалуйста, отправьте число от 0 до 100 в виде текста.")
-        logger.info(f"Пользователь {message.from_user.id} ({message.from_user.full_name}) отправил не-текстовое сообщение (тип: {message.content_type})", extra={'color': ERROR_COLOR})
+        log_user_action(message.from_user, f"Отправил не-текст при вводе баллов: {message.content_type}")
 
-# Глобальная обработка не-текстовых сообщений вне ввода баллов
 @router.message()
 async def handle_any_non_text(message: types.Message):
     if not message.text:
         await message.answer("Пожалуйста, используйте текстовые команды или кнопки.")
-        logger.info(f"Пользователь {message.from_user.id} ({message.from_user.full_name}) отправил не-текстовое сообщение вне ожидания баллов (тип: {message.content_type})", extra={'color': ERROR_COLOR})
+        log_user_action(message.from_user, f"Отправил не-текст вне диалога: {message.content_type}")
 
-# Обработка ошибок
+# --- ОБРАБОТКА ОШИБОК AIOGRAM ---
 @dp.error()
-async def errors_handler(*args, **kwargs):
-    # aiogram может вызывать обработчик с разными сигнатурами; попробуем извлечь exception
-    exception = kwargs.get('exception')
-    if not exception:
-        if len(args) >= 2:
-            exception = args[1]
-        elif len(args) == 1:
-            exception = args[0]
-    if exception:
-        try:
-            logger.exception(f"Ошибка: {exception}", extra={'color': ERROR_COLOR})
-        except Exception:
-            try:
-                logger.error(f"Ошибка: {exception}", extra={'color': ERROR_COLOR})
-            except Exception:
-                pass
-    else:
-        try:
-            logger.error(f"errors_handler вызван без exception; args={args} kwargs={kwargs}", extra={'color': ERROR_COLOR})
-        except Exception:
-            pass
-    return True
+async def errors_handler(event: types.ErrorEvent):
+    log_error(f"Ошибка aiogram: {event.exception}")
 
 # ---------- Healthcheck HTTP-сервер для Render ----------
 async def run_health_server():
-    """Запускает простой HTTP-сервер, который отвечает 200 OK на любой запрос.
-    Render ожидает, что сервис слушает порт, указанный в переменной окружения PORT."""
     app = web.Application()
-    # Обработчик для любого пути
     async def health_handler(request):
         return web.Response(text="OK", status=200)
     app.router.add_get('/{tail:.*}', health_handler)
     app.router.add_post('/{tail:.*}', health_handler)
-    # Получаем порт из переменной окружения (Render передаёт её автоматически)
     port = int(os.getenv('PORT', 10000))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"Healthcheck сервер запущен на порту {port}", extra={'color': START_COLOR})
-    # Бесконечно ждём, чтобы сервер не завершился (все запросы обрабатываются в фоне)
+    log_system(f"Healthcheck сервер запущен на порту {port}")
     await asyncio.Event().wait()
 
 # ---------------------------------------------------------
 
 if __name__ == '__main__':
-    logger.info("Бот запущен", extra={'color': START_COLOR})
+    log_system("Инициализация систем...")
+    print(f"{Fore.CYAN}================================================={Style.RESET_ALL}")
+    print(f"{Fore.CYAN}   VUZ BOT ЗАПУЩЕН И СМОТРИТ В ЛОГИ              {Style.RESET_ALL}")
+    print(f"{Fore.CYAN}================================================={Style.RESET_ALL}")
+
     async def _runner():
-        # Запускаем healthcheck-сервер в фоне
         asyncio.create_task(run_health_server())
-        
         backoff = 1
         while True:
             try:
-                logger.info("Запуск polling...", extra={'color': START_COLOR})
+                log_system("Запуск polling...")
                 await dp.start_polling(bot)
-                logger.info("Polling завершился корректно, перезапуск через 1 сек.", extra={'color': START_COLOR})
+                log_system("Polling завершился корректно, перезапуск через 1 сек.")
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Ошибка запуска/прохождения polling: {e}", extra={'color': ERROR_COLOR})
+                log_error(f"Ошибка запуска/прохождения polling: {e}")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 
     try:
         asyncio.run(_runner())
     except Exception as e:
-        logger.error(f"Фатальная ошибка: {e}", extra={'color': ERROR_COLOR})
+        log_error(f"Фатальная ошибка: {e}")
