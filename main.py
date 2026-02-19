@@ -10,6 +10,9 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from aiogram.filters import CommandStart, StateFilter
 from colorama import init, Fore, Style
 
+# Для healthcheck-сервера
+from aiohttp import web
+
 # Инициализация colorama для цветного логирования
 init(autoreset=True)
 
@@ -38,9 +41,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.handlers = [file_handler, stream_handler]
 
-# Токен бота (читается из переменной окружения `BOT_TOKEN`, при отсутствии — используйте встроенный токен)
+# Токен бота (читается из переменной окружения `BOT_TOKEN`)
 TOKEN = os.getenv('BOT_TOKEN')
-
 
 # Загрузка данных из JSON с обработкой ошибок и валидацией
 VUZ_DATA = []
@@ -113,7 +115,6 @@ def parse_subjects(subjects_str):
         else:
             required.append(subj)
     return required, alternatives
-
 
 # Маппинг отображаемых имён предметов -> внутренние ключи
 SUBJECT_DISPLAY = {
@@ -269,7 +270,6 @@ async def confirm_selection(callback_query: types.CallbackQuery, state: FSMConte
         logger.exception(f"confirm_selection error: {e}", extra={'color': ERROR_COLOR})
         return
 
-
 # Обработчик возврата в главное меню через inline-кнопку
 @router.callback_query(lambda c: c.data == 'main_menu', StateFilter(UserState.choosing_subjects))
 async def main_menu_callback(callback_query: types.CallbackQuery, state: FSMContext):
@@ -281,7 +281,6 @@ async def main_menu_callback(callback_query: types.CallbackQuery, state: FSMCont
     except Exception as e:
         logger.exception(f"main_menu_callback error: {e}", extra={'color': ERROR_COLOR})
         return
-
 
 # Ввод баллов (нажатие на кнопку предмета)
 @router.callback_query(lambda c: c.data.startswith('enter_'), StateFilter(UserState.entering_scores))
@@ -296,9 +295,6 @@ async def enter_score(callback_query: types.CallbackQuery, state: FSMContext):
     except Exception as e:
         logger.exception(f"enter_score error: {e}", extra={'color': ERROR_COLOR})
         return
-
-
-# (Удалён: обработка через reply-клавиатуру не используется — применяем inline-кнопки)
 
 # Обработка ввода балла
 @router.message(lambda message: message.text and message.text.isdigit(), StateFilter(UserState.entering_scores))
@@ -348,7 +344,6 @@ async def process_score(message: types.Message, state: FSMContext):
         return
 
 # Показ результата
-
 async def send_result(chat_id: int, state: FSMContext):
     try:
         data = await state.get_data()
@@ -489,7 +484,6 @@ async def finish_results(callback_query: types.CallbackQuery, state: FSMContext)
         logger.exception(f"finish_results error: {e}", extra={'color': ERROR_COLOR})
         return
 
-
 # Обработка главного меню (reply-клавиатура)
 @router.message(lambda m: m.text == 'Подобрать по ЕГЭ', StateFilter(UserState.start_menu))
 async def menu_pick_by_scores(message: types.Message, state: FSMContext):
@@ -508,7 +502,6 @@ async def menu_pick_by_scores(message: types.Message, state: FSMContext):
     await message.answer('Выберите предметы, которые вы сдавали (нажмите по каждому):', reply_markup=keyboard)
     await state.set_state(UserState.choosing_subjects)
 
-
 @router.message(lambda m: m.text == 'Просмотреть направления', StateFilter(UserState.start_menu))
 async def menu_view_directions(message: types.Message, state: FSMContext):
     # Показать список вузов (reply keyboard)
@@ -525,7 +518,6 @@ async def menu_view_directions(message: types.Message, state: FSMContext):
     await message.answer('Выберите вуз:', reply_markup=kb)
     await state.set_state(UserState.choosing_university)
 
-
 # Обработка выбора вуза
 @router.message(StateFilter(UserState.choosing_university))
 async def choose_university(message: types.Message, state: FSMContext):
@@ -541,7 +533,6 @@ async def choose_university(message: types.Message, state: FSMContext):
     await state.update_data(filtered_directions=filtered, current_index=0, last_result_message_id=None)
     await send_result(message.chat.id, state)
     await state.set_state(UserState.viewing_results)
-
 
 # Обработка не-текстовых сообщений (фото, видео, гиф, документы и т.д.)
 @router.message(StateFilter(UserState.entering_scores))
@@ -582,9 +573,34 @@ async def errors_handler(*args, **kwargs):
             pass
     return True
 
+# ---------- Healthcheck HTTP-сервер для Render ----------
+async def run_health_server():
+    """Запускает простой HTTP-сервер, который отвечает 200 OK на любой запрос.
+    Render ожидает, что сервис слушает порт, указанный в переменной окружения PORT."""
+    app = web.Application()
+    # Обработчик для любого пути
+    async def health_handler(request):
+        return web.Response(text="OK", status=200)
+    app.router.add_get('/{tail:.*}', health_handler)
+    app.router.add_post('/{tail:.*}', health_handler)
+    # Получаем порт из переменной окружения (Render передаёт её автоматически)
+    port = int(os.getenv('PORT', 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info(f"Healthcheck сервер запущен на порту {port}", extra={'color': START_COLOR})
+    # Бесконечно ждём, чтобы сервер не завершился (все запросы обрабатываются в фоне)
+    await asyncio.Event().wait()
+
+# ---------------------------------------------------------
+
 if __name__ == '__main__':
     logger.info("Бот запущен", extra={'color': START_COLOR})
     async def _runner():
+        # Запускаем healthcheck-сервер в фоне
+        asyncio.create_task(run_health_server())
+        
         backoff = 1
         while True:
             try:
